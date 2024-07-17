@@ -1,0 +1,176 @@
+---
+title: "data calculations for Asamoto et al. 2024"
+date: "Last knitted on `r format(Sys.Date(), '%d %b %Y')`"
+author: "Ciara Asamoto, Sebastian Kopf"
+output:
+  html_document: 
+    css: stylesheet.css
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(stringr)
+library(tidyr)
+library(plotly)
+library(knitr)
+library(dplyr)
+library(readxl)
+library(writexl)
+library(broom)
+library(purrr)
+
+knitr::opts_chunk$set(
+  root.dir = ".", dev=c("png", "pdf"), 
+  dev.args=list(pdf = list(encoding="WinAnsi", useDingbats=FALSE)),
+  fig.keep="all", fig.path=file.path("plots", "run5_"), fig.width=9, fig.height=7)
+```
+
+# Load dfs, combine into one dataframe
+
+```{r}
+
+iso_ic_df <- read_xlsx("data/dataset.xlsx", sheet = "IC_iso") # isotope and IC data
+
+growth_df <- read_xlsx("data/dataset.xlsx", sheet = "hour_od") # growth rate data
+
+```
+
+# Dd calculations
+
+```{r}
+  calc_df <- iso_ic_df %>%
+  group_by(exp, replicate) %>%
+  mutate(
+    NOx_0 = no3_mM_corrected[timepoint == min(timepoint)[1]],
+    d15_0 = d15.cal[timepoint == min(timepoint)[1]],
+    d18_0 = d18.cal[timepoint == min(timepoint)[1]],
+    ln_NO3 = log(no3_mM_corrected/NOx_0),
+    f = no3_mM_corrected/NOx_0,
+    D_d15N = d15.cal - d15_0,
+    D_d18O = d18.cal - d18_0,
+    d18_d15 = D_d15N / D_d18O,
+    ln_d15N = log((d15.cal/ 1000 + 1) / (d15_0/1000 +1)),
+    ln_d18O = log((d18.cal/ 1000 + 1) / (d18_0/1000 +1))
+  )
+
+```
+
+# Calculate isotope effects
+
+```{r}
+# calculate fractionation factors for all culture replicates. note that more negative values for epsilon should reflect increased 15N or 18O enrichment. however, many in the N isotope field choose to use positive values instead, so to make our data easier to compare to other data in the field we have multiplied our epsilon values by -1.
+
+eps_data <- calc_df %>% 
+  nest(data = c(-exp, -replicate)) %>% 
+  mutate(
+    fit_15N = purrr::map(data, ~lm(ln_d15N ~ ln_NO3, data = .x)),
+    coefs_15N = purrr::map(fit_15N, tidy),
+    summary_15N = purrr::map(fit_15N, glance),
+    eps15N.permil = purrr::map_dbl(coefs_15N, ~filter(.x, term == "ln_NO3")$estimate * 1000 * -1),
+    eps15N_se.permil = purrr::map_dbl(coefs_15N, ~filter(.x, term == "ln_NO3")$std.error * 1000 * -1),
+    fit_18O = purrr::map(data, ~lm(ln_d18O ~ ln_NO3, data = .x)),
+    coefs_18O = purrr::map(fit_18O, tidy),
+    summary_18O = purrr::map(fit_18O, glance),
+    eps18O.permil = purrr::map_dbl(coefs_18O, ~filter(.x, term == "ln_NO3")$estimate * 1000 * -1),
+    eps18O_se.permil = purrr::map_dbl(coefs_18O, ~filter(.x, term == "ln_NO3")$std.error * 1000 * -1)
+  ) %>% 
+  select(-data, -starts_with("fit"), -starts_with("coefs"), -starts_with("summary")) %>% 
+  ungroup()
+
+# calculate means and std deviation 
+eps_stats <- eps_data %>%
+  group_by(exp) %>% 
+  mutate(
+    n_eps = n(),
+    mean_eps15 = mean(eps15N.permil),
+    sd_eps15 = sd(eps15N.permil),
+    se_eps15 = sd_eps15/ sqrt(n_eps),
+    mean_eps18 = mean(eps18O.permil),
+    sd_eps18 = sd(eps18O.permil),
+    se_eps18 = sd_eps18/ sqrt(n_eps),
+    min_eps15 = min(eps15N.permil),
+    max_eps15 = max(eps15N.permil),
+    min_eps18 = min(eps18O.permil),
+    max_eps18 = max(eps18O.permil)
+    ) 
+ 
+eps_summary <- eps_stats %>% 
+  select(exp, mean_eps15, min_eps15, max_eps15, sd_eps15, mean_eps18,min_eps18, max_eps18, sd_eps18) %>% 
+  distinct()
+
+```
+
+# o/n coupling
+
+```{r}
+
+coupling_data <-
+  calc_df %>% 
+  nest(data = c(-exp, -replicate)) %>% 
+  mutate(
+    n_datapoints_on = map_int(data, nrow),
+    fit = purrr::map(data, ~lm(ln_d18O ~ ln_d15N, data = .x)),
+    coefs = purrr::map(fit, tidy),
+    summary = purrr::map(fit, glance),
+    ON_ratio = purrr::map_dbl(coefs, ~filter(.x, term == "ln_d15N")$estimate),
+    ON_ratio_se = purrr::map_dbl(coefs, ~filter(.x, term == "ln_d15N")$std.error),
+  ) %>% 
+  select(exp, n_datapoints_on, ON_ratio, ON_ratio_se) %>% 
+  unnest() %>% 
+  group_by(exp) %>% 
+  mutate(
+    mean_ON_ratio = mean(ON_ratio),
+    sd_ON_ratio = sd(ON_ratio),
+    min_ON_ratio = min(ON_ratio),
+    max_ON_ratio = max(ON_ratio),
+    datapoints_on = sum(n_datapoints_on)
+  ) %>% 
+  select(exp, mean_ON_ratio, sd_ON_ratio, min_ON_ratio, max_ON_ratio, datapoints_on) %>% 
+  distinct()
+
+```
+
+# calculate growth rates
+```{r}
+ source(file.path("scripts/growth_functions.R"))
+
+# calculate growth rates for each replicate
+growth_rates_data <- 
+  growth_df %>% 
+  nest(data = c(-exp, -replicate)) %>% 
+  mutate(
+    n_datapoints_gr = purrr::map_int(data, nrow),
+    fit = purrr::map(data, ~SummarizeGrowth(.x$hour, .x$OD)),
+    info = purrr::map(fit, ~as.data.frame(setNames(as.list(as.numeric(.x$vals)), names(.x$vals)))),
+    hour_min = purrr::map_dbl(data, ~min(.x$hour)), # data range min
+    hour_max =purrr:: map_dbl(data, ~max(.x$hour)) # data range max
+  ) %>% 
+  unnest(info) %>% 
+  select(
+    exp, replicate, n_datapoints_gr, hour_min, hour_max,
+    OD0 = n0, # OD at t0
+    K = k, # carrying capacity (i.e. OD max)
+    mu.1_hr = r, # growth rate in 1/hr
+    mu_se.1_hr = r_se, # standard error of the growth rate
+  )
+
+growth_rate_df <- growth_rates_data %>% 
+  group_by(exp) %>% 
+  mutate(
+    avg_mu = mean(mu.1_hr),
+    sd_mu = sd(mu.1_hr)
+  )
+
+```
+
+# final df for making figures
+```{r}
+final_df <- full_join(coupling_data, eps_summary)
+
+write_xlsx(final_df, "data/figure_df.xlsx")
+```
+
